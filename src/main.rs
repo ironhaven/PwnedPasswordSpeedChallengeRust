@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use reqwest::Client;
 use sha1::Digest;
 use std::str::from_utf8;
@@ -22,7 +23,9 @@ fn hex(b: &[u8; 20]) -> [u8; 40] {
     })
 }
 
-async fn check_password(password: &str, client: Arc<Client>) -> u32 {
+type Cache = DashMap<[u8; 5], Box<[([u8;35], u32)]>>;
+
+async fn check_password(password: &str, client: Arc<Client>, cache: Arc<Cache>) -> u32 {
 
     let mut sha = sha1::Sha1::new();
     sha.update(password.as_bytes());
@@ -30,24 +33,37 @@ async fn check_password(password: &str, client: Arc<Client>) -> u32 {
     let hex = hex((&bytes[..]).try_into().unwrap());
     
 
-    let (start, rest) = std::str::from_utf8(&hex).unwrap().split_at(5);
-    let url = format!("https://api.pwnedpasswords.com/range/{}", start);
+    let (start, rest) = hex.as_slice().split_at(5);
+    let url = format!("https://api.pwnedpasswords.com/range/{}", from_utf8(start).unwrap());
+    let start: &[u8; 5] = start.try_into().unwrap();
+    let rest: &[u8; 35] = rest.try_into().unwrap();
 
 
-    let response = client.get(url).send()
+    if let Some(result) = cache.get(start) {
+        println!("CACHE HIT!!!");
+        result.iter().find(|&x | &x.0 == rest).map(|x| x.1).unwrap_or(0)
+    } else {
+        let response = client.get(url).send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
 
-    let count = response
-        .as_str()
-        .lines()
-        .filter(|line| line.starts_with(rest))
-        .map(|it| it.split_once(':').unwrap().1.parse().unwrap()).next().unwrap_or(0);
-
-    count
+        let mut my_count = 0;
+        
+        let counts: Vec<([u8;35], u32)> = response.lines().map(|line| {
+            let (hash,count) = line.split_once(':').unwrap();
+            let hash = hash.as_bytes().try_into().unwrap();
+            let count = count.parse().unwrap();
+            if &hash == rest {
+                my_count = count;
+            }
+            (hash,count)
+        }).collect();
+        cache.insert(*start, counts.into_boxed_slice());
+        my_count
+    }
 }
 
 #[tokio::main]
@@ -72,6 +88,7 @@ async fn main() {
     // The max amount of allowed concurrent streams in a http/2 request is usually 100.
     // I wish i could see the negoicated streams limit sent in the raw http/2 data
     let tickets = Arc::new(Semaphore::new(100));
+    let arc_cache: Arc<Cache> = Arc::new(DashMap::new());
 
     while let Some(line) = lines.next_line().await.unwrap() {
         
@@ -79,11 +96,12 @@ async fn main() {
         let password = line.into_boxed_str();
         let client = Arc::clone(&client);
         let tickets = Arc::clone(&tickets);
+        let cache = Arc::clone(&arc_cache);
         tokio::spawn(async move {
 
             let _ticket = tickets.acquire().await.unwrap();
             let start = std::time::Instant::now();
-            let cnt = check_password(&password, client).await;
+            let cnt = check_password(&password, client, cache).await;
             tx.send((password, cnt, start.elapsed().as_millis() as u64)).await.unwrap();
         });
     }
