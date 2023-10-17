@@ -1,14 +1,16 @@
-use dashmap::DashMap;
 use reqwest::Client;
-use sha1::Digest;
-use std::str::from_utf8;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::{timeout, Interval};
+use sha1::{Digest, Sha1};
+use tokio_util::either::Either;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::str::from_utf8;
+
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
+
+use clap::Parser;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 
 fn hex(b: &[u8; 20]) -> [u8; 40] {
@@ -26,7 +28,19 @@ fn hex(b: &[u8; 20]) -> [u8; 40] {
     })
 }
 
-type Cache = DashMap<[u8; 5], Box<[([u8; 35], u32)]>>;
+#[derive(Parser, Debug)]
+/// PwnedPasswordsSpeedChallege program that checks plain text passwords with PwnedPasswords and outputs
+/// the results as a csv file or stdout.
+struct Args {
+    #[arg(long, short)]
+    /// Filepath to a newline delimited UTF-8 passwords file
+    infile: PathBuf,
+    #[arg(long, short)]
+    /// Filepath to write password breach occerences too. Default is writing to stdout
+    outfile: Option<PathBuf>,
+}
+
+type Cache = RwLock<HashMap<[u8; 5], Box<[([u8; 35], u32)]>>>;
 
 enum CacheStatus {
     Local,
@@ -39,148 +53,115 @@ async fn check_password(
     client: &Client,
     cache: &Cache,
 ) -> reqwest::Result<(u32, CacheStatus)> {
-    let hex = hex(
-        sha1::Sha1::new_with_prefix(password.as_bytes()).finalize()[..]
-            .try_into()
-            .unwrap(),
-    );
+    let hex = hex(Sha1::new_with_prefix(password.as_bytes())
+        .finalize()
+        .as_ref());
 
     let (start, rest) = hex.as_slice().split_at(5);
-    let url = format!(
-        "https://api.pwnedpasswords.com/range/{}",
-        from_utf8(start).unwrap()
-    );
     let start: &[u8; 5] = start.try_into().unwrap();
     let rest: &[u8; 35] = rest.try_into().unwrap();
 
-    let mut status = CacheStatus::Miss;
+    if let Some(result) = cache.read().unwrap().get(start) {
+        return Ok((
+            result
+                .iter()
+                .find(|&x| &x.0 == rest)
+                .map(|x| x.1)
+                .unwrap_or(0),
+            CacheStatus::Local,
+        ));
+    }
+    let response = client
+        .get(format!(
+            "https://api.pwnedpasswords.com/range/{}",
+            from_utf8(start).unwrap()
+        ))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
 
-    let count = if let Some(result) = cache.get(start) {
-        status = CacheStatus::Local;
-        result
-            .iter()
-            .find(|&x| &x.0 == rest)
-            .map(|x| x.1)
-            .unwrap_or(0)
-    } else {
-        let response = client
-            .get(url)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
+    let caching = response
+        .headers()
+        .get("cf-cache-status")
+        .map(|status| {
+            if status == "HIT" {
+                CacheStatus::Cloudflare
+            } else {
+                CacheStatus::Miss
+            }
+        })
+        .unwrap_or(CacheStatus::Miss);
 
-        if response
-            .headers()
-            .get("cf-cache-status")
-            .map(|status| status == "HIT")
-            .unwrap_or(false)
-        {
-            status = CacheStatus::Cloudflare;
-        }
+    let mut my_count = 0;
 
-        let mut my_count = 0;
-
-        let counts: Vec<([u8; 35], u32)> = response
-            .text()
-            .await?
-            .lines()
-            .map(|line| {
-                let (hash, count) = line.split_once(':').unwrap();
-                let hash = hash.as_bytes().try_into().unwrap();
-                let count = count.parse().unwrap();
-                if &hash == rest {
-                    my_count = count;
-                }
-                (hash, count)
-            })
-            .collect();
-        cache.insert(*start, counts.into_boxed_slice());
-        my_count
-    };
-    Ok((count, status))
+    let counts: Vec<([u8; 35], u32)> = response
+        .text()
+        .await?
+        .lines()
+        .map(|line| {
+            let (hash, count) = line.split_once(':').unwrap();
+            let hash = hash.as_bytes().try_into().unwrap();
+            let count = count.parse().unwrap();
+            if &hash == rest {
+                my_count = count;
+            }
+            (hash, count)
+        })
+        .collect();
+    cache
+        .write()
+        .unwrap()
+        .insert(*start, counts.into_boxed_slice());
+    Ok((my_count, caching))
 }
 
 #[tokio::main]
 async fn main() {
-    let (final_tx, mut final_rx) = mpsc::channel::<(Box<str>, u32, u64, CacheStatus)>(1024);
+    let args = Args::parse();
 
-    let sink = tokio::spawn(async move {
-        let mut int = tokio::time::interval(Duration::from_secs(10));
-        let mut sum = 0;
-        let mut count = 0;
-        let mut local_hits = 0;
-        let mut cf_hits = 0;
-        loop {
-            tokio::select! {
-                channel_value = final_rx.recv() => {
-                    if let Some((password, cnt, time ,cache)) = channel_value {
-                        sum += time;
-                        count += 1;
-                        match cache {
-                            CacheStatus::Local => local_hits += 1,
-                            CacheStatus::Cloudflare => cf_hits += 1,
-                            CacheStatus::Miss => (),
-                        }
-                        println!("{},{}", password, cnt);
-                    } else {
-                        break;
-                    }
-                }
-                _ = int.tick() => {
-                    if count > 0 {
-                        eprintln!("done {count}");
-                        eprintln!("average: {}ms", sum / count);
-                        eprintln!("local cache rate: {:.2}%", (local_hits as f64 / count as f64) * 100.0);
-                        eprintln!("cloudflare cache rate: {:.2}%", (cf_hits as f64 / (count - local_hits) as f64) * 100.0);
-                    } else {
-                        eprintln!("No request completed");
-                    }
-                    sum = 0;
-                    count = 0;
-                    local_hits = 0;
-                    cf_hits = 0;
-                }
-            }
-        }
-        eprintln!("done here too?");
-    });
-
-
-    let client = Arc::new(
-        Client::builder()
-            .http2_prior_knowledge()
-            .user_agent("github.com/ironhaven/PwnedPasswordsSpeedChallenge")
-            .build()
-            .unwrap(),
-    );
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    static TICKETS: OnceLock<Semaphore> = OnceLock::new();
+    static CLIENT: OnceLock<Client> = OnceLock::new();
     // The max amount of allowed concurrent streams in a http/2 request is usually 100.
     // I wish i could see the negoicated streams limit sent in the raw http/2 data
-    let tickets = Arc::new(Semaphore::new(100));
-    let arc_cache: Arc<Cache> = Arc::new(DashMap::new());
+    // I also wish that cloudflare would tell me their rate liming parameter exactly
+    // because it seems like tcp socket get randomly reset when there is a lot of requests.
+    // If I set less permits the connections don't get reset as much but the bandwidth still gets
+    // throtled to < 64 mbps rather than my 400 max home internet and
+    // will download slower than the higher request limit.
+    // Anyway 100 permits provites better request throughput than less permits.
+    const PERMITS: usize = 100;
+    let (final_tx, mut final_rx) = mpsc::channel::<(Box<str>, u32, u64, CacheStatus)>(1024);
 
-    let passwords = tokio::fs::File::open("input.txt").await.unwrap();
-    let passwords = tokio::io::BufReader::new(passwords);
-    let mut lines = passwords.lines();
-
+    let input_file = tokio::fs::File::open(args.infile).await.unwrap();
+    let mut lines = tokio::io::BufReader::new(input_file).lines();
     while let Some(line) = lines.next_line().await.unwrap() {
         let tx = final_tx.clone();
         let password = line.into_boxed_str();
-        let client = Arc::clone(&client);
-        let tickets = Arc::clone(&tickets);
-        let cache = Arc::clone(&arc_cache);
+        let client = CLIENT.get_or_init(|| {
+            Client::builder()
+                .http2_prior_knowledge()
+                .user_agent("github.com/ironhaven/PwnedPasswordsSpeedChallenge")
+                .gzip(true)
+                .build()
+                .unwrap()
+        });
+        let tickets = TICKETS.get_or_init(|| Semaphore::new(PERMITS));
+        let cache = CACHE.get_or_init(|| Cache::default());
         tokio::spawn(async move {
             let _ticket = tickets.acquire().await.unwrap();
-            let mut backoff = 100;
+            let mut backoff = 10;
             let start = std::time::Instant::now();
             let (cnt, cache_status) = loop {
                 match check_password(&password, &client, &cache).await {
                     Ok((cnt, status)) => break (cnt, status),
                     Err(e) => {
                         eprintln!("Backing off from '{e:?}' on '{password}'");
-                        if backoff > 1000 {
+                        if backoff > 100 {
                             panic!("Retrying connection too many times");
                         }
-                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                        tokio::time::sleep(Duration::from_millis(backoff + fastrand::u64(0..=100)))
+                            .await;
                         backoff *= 2;
                     }
                 }
@@ -195,9 +176,65 @@ async fn main() {
             .unwrap();
         });
     }
+    // Because rust is fast expect all of the passwords in the input file to be spawned as async tasks
+    // before the mpsc channel fills
     eprintln!("All passwords read");
     drop(final_tx);
-    sink.await.unwrap();
-    eprintln!("Done!");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // not ugly
+    let mut out = match args.outfile {
+        Some(path) => Either::Left(tokio::io::BufWriter::new(
+            tokio::fs::File::open(path).await.unwrap(),
+        )),
+        None => Either::Right(tokio::io::stdout()),
+    };
+
+    let mut int = tokio::time::interval(Duration::from_secs(10));
+    let mut sum = 0;
+    let mut count = 0;
+    let mut local_hits = 0;
+    let mut cf_hits = 0;
+    loop {
+        tokio::select! {
+            channel_value = final_rx.recv() => {
+                let Some((password, cnt, time ,cache)) = channel_value else { break };
+                sum += time;
+                count += 1;
+                match cache {
+                    CacheStatus::Local => local_hits += 1,
+                    CacheStatus::Cloudflare => cf_hits += 1,
+                    CacheStatus::Miss => (),
+                }
+                out.write_all(format!("{},{}\n", password, cnt).as_bytes()).await.unwrap();
+            }
+            _ = int.tick() => {
+                if count > 0 {
+                    eprintln!("done {count}");
+                    eprintln!("average: {}ms", sum / count);
+                    eprintln!("local cache rate: {:.2}%", (local_hits as f64 / count as f64) * 100.0);
+                    eprintln!("cloudflare cache rate: {:.2}%", (cf_hits as f64 / (count - local_hits) as f64) * 100.0);
+                } else {
+                    eprintln!("No requests completed");
+                }
+                sum = 0;
+                count = 0;
+                local_hits = 0;
+                cf_hits = 0;
+            }
+        }
+    }
+    eprintln!("Exiting!");
+    if count > 0 {
+        eprintln!("done {count}");
+        eprintln!("average: {}ms", sum / count);
+        eprintln!(
+            "local cache rate: {:.2}%",
+            (local_hits as f64 / count as f64) * 100.0
+        );
+        eprintln!(
+            "cloudflare cache rate: {:.2}%",
+            (cf_hits as f64 / (count - local_hits) as f64) * 100.0
+        );
+    } else {
+        eprintln!("No requests completed");
+    }
 }

@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-dashmap = "5.5.3"
+clap = { version = "4.4.6", features = ["derive"] }
+fastrand = "2.0.1"
 reqwest = { version = "0.11.22", default-features=false, features = ["stream", "rustls-tls", "gzip"] }
 sha1 = "0.10.6"
-tokio = { version = "1.33.0", features = ["full"] }
-tokio-util = { version = "0.7.9", features = ["io"] }
+tokio = { version = "1.33.0", default-features=false, features = ["rt", "rt-multi-thread", "time","sync", "macros","io-std"] }
+tokio-util = { version = "0.7.9", features = ["io-util"] }
