@@ -1,5 +1,6 @@
 use reqwest::Client;
 use sha1::{Digest, Sha1};
+use tinystr::TinyAsciiStr;
 use tokio_util::either::Either;
 
 use std::collections::HashMap;
@@ -40,7 +41,7 @@ struct Args {
     outfile: Option<PathBuf>,
 }
 
-type Cache = RwLock<HashMap<[u8; 5], Box<[([u8; 35], u32)]>>>;
+type Cache = RwLock<HashMap<TinyAsciiStr<5>, Box<[(TinyAsciiStr<35>, u32)]>>>;
 
 enum CacheStatus {
     Local,
@@ -58,24 +59,23 @@ async fn check_password(
         .as_ref());
 
     let (start, rest) = hex.as_slice().split_at(5);
-    let start: &[u8; 5] = start.try_into().unwrap();
-    let rest: &[u8; 35] = rest.try_into().unwrap();
+    let start: TinyAsciiStr<5> = TinyAsciiStr::from_bytes(start).unwrap();
+    let rest: TinyAsciiStr<35> = TinyAsciiStr::from_bytes(rest).unwrap();
 
-    if let Some(result) = cache.read().unwrap().get(start) {
+    if let Some(result) = cache.read().unwrap().get(&start) {
         return Ok((
             result
                 .iter()
-                .find(|&x| &x.0 == rest)
+                .find(|&x| &x.0 == &rest)
                 .map(|x| x.1)
                 .unwrap_or(0),
             CacheStatus::Local,
         ));
     }
+    let mut url: [u8; 42] = *b"https://api.pwnedpasswords.com/range/XXXXX";
+    url[42 - 5..].copy_from_slice(start.as_bytes());
     let response = client
-        .get(format!(
-            "https://api.pwnedpasswords.com/range/{}",
-            from_utf8(start).unwrap()
-        ))
+        .get(from_utf8(&url).unwrap())
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
@@ -94,24 +94,24 @@ async fn check_password(
 
     let mut my_count = 0;
 
-    let counts: Vec<([u8; 35], u32)> = response
-        .text()
-        .await?
-        .lines()
-        .map(|line| {
-            let (hash, count) = line.split_once(':').unwrap();
-            let hash = hash.as_bytes().try_into().unwrap();
-            let count = count.parse().unwrap();
-            if &hash == rest {
-                my_count = count;
-            }
-            (hash, count)
-        })
-        .collect();
-    cache
-        .write()
-        .unwrap()
-        .insert(*start, counts.into_boxed_slice());
+    let mut vec = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|len| (len / 38) as usize)
+            .unwrap_or(900),
+    );
+
+    vec.extend(response.text().await?.lines().map(|line| {
+        let (hash, count) = line.split_once(':').unwrap();
+        let hash = TinyAsciiStr::from_str(hash).unwrap();
+        let count = count.parse().unwrap();
+        if &hash == &rest {
+            my_count = count;
+        }
+        (hash, count)
+    }));
+    let counts = vec.into_boxed_slice();
+    cache.write().unwrap().insert(start, counts);
     Ok((my_count, caching))
 }
 
@@ -131,7 +131,7 @@ async fn main() {
     // will download slower than the higher request limit.
     // Anyway 100 permits provites better request throughput than less permits.
     const PERMITS: usize = 100;
-    let (final_tx, mut final_rx) = mpsc::channel::<(Box<str>, u32, u64, CacheStatus)>(1024);
+    let (final_tx, mut final_rx) = mpsc::channel::<(Box<str>, u32, u32, CacheStatus)>(1024);
 
     let input_file = tokio::fs::File::open(args.infile).await.unwrap();
     let mut lines = tokio::io::BufReader::new(input_file).lines();
@@ -147,7 +147,13 @@ async fn main() {
                 .unwrap()
         });
         let tickets = TICKETS.get_or_init(|| Semaphore::new(PERMITS));
-        let cache = CACHE.get_or_init(|| Cache::default());
+        let cache = CACHE.get_or_init(|| {
+            if let Ok(file) = std::fs::File::open(".cache") {
+                Cache::new(serde_json::from_reader(std::io::BufReader::new(file)).unwrap())
+            } else {
+                Cache::default()
+            }
+        });
         tokio::spawn(async move {
             let _ticket = tickets.acquire().await.unwrap();
             let mut backoff = 10;
@@ -169,7 +175,7 @@ async fn main() {
             tx.send((
                 password,
                 cnt,
-                start.elapsed().as_millis() as u64,
+                start.elapsed().as_millis() as u32,
                 cache_status,
             ))
             .await
@@ -183,7 +189,7 @@ async fn main() {
     // not ugly
     let mut out = match args.outfile {
         Some(path) => Either::Left(tokio::io::BufWriter::new(
-            tokio::fs::File::open(path).await.unwrap(),
+            tokio::fs::File::create(path).await.unwrap(),
         )),
         None => Either::Right(tokio::io::stdout()),
     };
@@ -207,6 +213,7 @@ async fn main() {
                 out.write_all(format!("{},{}\n", password, cnt).as_bytes()).await.unwrap();
             }
             _ = int.tick() => {
+                eprintln!("cache size: {}", CACHE.get().map(|x| x.read().unwrap().len()).unwrap_or(0));
                 if count > 0 {
                     eprintln!("done {count}");
                     eprintln!("average: {}ms", sum / count);
@@ -237,4 +244,12 @@ async fn main() {
     } else {
         eprintln!("No requests completed");
     }
+
+    tokio::task::block_in_place(|| {
+        serde_json::to_writer(
+            std::io::BufWriter::new(std::fs::File::create(".cache").unwrap()),
+            CACHE.get().unwrap(),
+        )
+        .unwrap()
+    });
 }
