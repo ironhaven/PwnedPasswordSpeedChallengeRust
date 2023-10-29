@@ -259,6 +259,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "drop_guard"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c4a817d8b683f6e649aed359aab0c47a875377516bb5791d0f7e46d9066d209"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -605,6 +611,7 @@ name = "passwordcheck"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "drop_guard",
  "fastrand",
  "reqwest",
  "serde",

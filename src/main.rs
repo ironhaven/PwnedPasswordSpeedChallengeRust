@@ -4,11 +4,12 @@ use tinystr::TinyAsciiStr;
 use tokio_util::either::Either;
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::from_utf8;
 
 use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -47,6 +48,39 @@ enum CacheStatus {
     Local,
     Cloudflare,
     Miss,
+}
+
+#[derive(Clone, Default)]
+struct Stats {
+    sum: u32,
+    count: u32,
+    local_hits: u32,
+    cf_hits: u32,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Default::default()
+    }
+    fn add(&mut self, time: u32, status: CacheStatus) {
+                self.sum += time;
+                self.count += 1;
+                match status {
+                    CacheStatus::Local => self.local_hits += 1,
+                    CacheStatus::Cloudflare => self.cf_hits += 1,
+                    CacheStatus::Miss => (),
+                }
+    }
+    fn print(&self) {
+        if self.count > 0 {
+            eprintln!("done {}", self.count);
+            eprintln!("average: {}ms", self.sum / self.count);
+            eprintln!("local cache rate: {:.2}%", (self.local_hits as f64 / self.count as f64) * 100.0);
+            eprintln!("cloudflare cache rate: {:.2}%", (self.cf_hits as f64 / (self.count - self.local_hits) as f64) * 100.0);
+        } else {
+            eprintln!("No requests completed");
+        }
+    }
 }
 
 async fn check_password(
@@ -124,13 +158,15 @@ async fn main() {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     // The max amount of allowed concurrent streams in a http/2 request is usually 100.
     // I wish i could see the negoicated streams limit sent in the raw http/2 data
-    // I also wish that cloudflare would tell me their rate liming parameter exactly
+    // I also wish i could know *who* is resetting my tcp socket (Comcast? Cloudflare? Some random middlebox between Comcast and Cloudflare?)
     // because it seems like tcp socket get randomly reset when there is a lot of requests.
     // If I set less permits the connections don't get reset as much but the bandwidth still gets
     // throtled to < 64 mbps rather than my 400 max home internet and
     // will download slower than the higher request limit.
     // Anyway 100 permits provites better request throughput than less permits.
     const PERMITS: usize = 100;
+    // Time to fill buffer = (bufferSize / PERMITS) * request length
+    // 1 second ~ (1024 / 100) * 100ms
     let (final_tx, mut final_rx) = mpsc::channel::<(Box<str>, u32, u32, CacheStatus)>(1024);
 
     let input_file = tokio::fs::File::open(args.infile).await.unwrap();
@@ -148,16 +184,18 @@ async fn main() {
         });
         let tickets = TICKETS.get_or_init(|| Semaphore::new(PERMITS));
         let cache = CACHE.get_or_init(|| {
-            if let Ok(file) = std::fs::File::open(".cache") {
-                Cache::new(serde_json::from_reader(std::io::BufReader::new(file)).unwrap())
-            } else {
-                Cache::default()
-            }
+            tokio::task::block_in_place(||{
+                if let Ok(file) = std::fs::File::open(".cache") {
+                    Cache::new(serde_json::from_reader(std::io::BufReader::new(file)).unwrap())
+                } else {
+                    Cache::default()
+                }
+            })
         });
         tokio::spawn(async move {
             let _ticket = tickets.acquire().await.unwrap();
             let mut backoff = 10;
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             let (cnt, cache_status) = loop {
                 match check_password(&password, &client, &cache).await {
                     Ok((cnt, status)) => break (cnt, status),
@@ -186,6 +224,19 @@ async fn main() {
     // before the mpsc channel fills
     eprintln!("All passwords read");
     drop(final_tx);
+
+    let _guard = drop_guard::guard(CACHE.get().unwrap(), |cache| {
+        eprintln!("Locking cache");
+        let handle  = cache.read().unwrap();
+        eprintln!("Saving cache to disk");
+        tokio::task::block_in_place(|| {
+            serde_json::to_writer(
+                std::io::BufWriter::new(std::fs::File::create(".cache").unwrap()),
+                handle.deref(),
+            )
+            .unwrap()
+        });
+    });
     // not ugly
     let mut out = match args.outfile {
         Some(path) => Either::Left(tokio::io::BufWriter::new(
@@ -194,62 +245,23 @@ async fn main() {
         None => Either::Right(tokio::io::stdout()),
     };
 
-    let mut int = tokio::time::interval(Duration::from_secs(10));
-    let mut sum = 0;
-    let mut count = 0;
-    let mut local_hits = 0;
-    let mut cf_hits = 0;
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut stats = Stats::new();
+    let cache = CACHE.get().unwrap();
     loop {
         tokio::select! {
             channel_value = final_rx.recv() => {
-                let Some((password, cnt, time ,cache)) = channel_value else { break };
-                sum += time;
-                count += 1;
-                match cache {
-                    CacheStatus::Local => local_hits += 1,
-                    CacheStatus::Cloudflare => cf_hits += 1,
-                    CacheStatus::Miss => (),
-                }
+                let Some((password, cnt, time, status)) = channel_value else { break };
+                stats.add(time,status);
                 out.write_all(format!("{},{}\n", password, cnt).as_bytes()).await.unwrap();
             }
-            _ = int.tick() => {
-                eprintln!("cache size: {}", CACHE.get().map(|x| x.read().unwrap().len()).unwrap_or(0));
-                if count > 0 {
-                    eprintln!("done {count}");
-                    eprintln!("average: {}ms", sum / count);
-                    eprintln!("local cache rate: {:.2}%", (local_hits as f64 / count as f64) * 100.0);
-                    eprintln!("cloudflare cache rate: {:.2}%", (cf_hits as f64 / (count - local_hits) as f64) * 100.0);
-                } else {
-                    eprintln!("No requests completed");
-                }
-                sum = 0;
-                count = 0;
-                local_hits = 0;
-                cf_hits = 0;
+            _ = interval.tick() => {
+                eprintln!("cache size: {}", cache.read().unwrap().len());
+                stats.print();
+                stats = Stats::new();
             }
         }
     }
-    eprintln!("Exiting!");
-    if count > 0 {
-        eprintln!("done {count}");
-        eprintln!("average: {}ms", sum / count);
-        eprintln!(
-            "local cache rate: {:.2}%",
-            (local_hits as f64 / count as f64) * 100.0
-        );
-        eprintln!(
-            "cloudflare cache rate: {:.2}%",
-            (cf_hits as f64 / (count - local_hits) as f64) * 100.0
-        );
-    } else {
-        eprintln!("No requests completed");
-    }
-
-    tokio::task::block_in_place(|| {
-        serde_json::to_writer(
-            std::io::BufWriter::new(std::fs::File::create(".cache").unwrap()),
-            CACHE.get().unwrap(),
-        )
-        .unwrap()
-    });
+    stats.print();
+    println!("Exiting main!");
 }
